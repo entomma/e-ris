@@ -189,6 +189,152 @@ if (isset($_GET['action']) && $_GET['action'] === 'get_loi_form') {
     exit();
 }
 // ====================================================
+// 🔹 AJAX: Get smart schedule recommendation
+// ====================================================
+if (isset($_GET['action']) && $_GET['action'] === 'get_recommendation') {
+    $current_semester = getCurrentSemester($conn);
+
+    // Get already temp-enrolled and DB-enrolled course IDs
+    $temp_course_ids = [];
+    foreach ($_SESSION['temp_enrollments'] as $te) {
+        $stmt = $conn->prepare("SELECT course_id FROM section_courses WHERE section_course_id = ?");
+        $stmt->execute([$te['section_course_id']]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($row) $temp_course_ids[] = $row['course_id'];
+    }
+
+    // Get available courses (same logic as fetch_available_subjects)
+    $exclude_clause = empty($temp_course_ids)
+        ? ""
+        : "AND c.course_id NOT IN (" . implode(',', array_fill(0, count($temp_course_ids), '?')) . ")";
+
+    $sql = "SELECT DISTINCT c.course_id, c.course_code, c.course_title, c.year_level, c.units
+            FROM courses c
+            WHERE c.semester = ?
+            AND c.course_id NOT IN (
+                SELECT course_id FROM student_subjects
+                WHERE student_id = ? AND status IN ('passed','failed','enrolled')
+            )
+            $exclude_clause
+            ORDER BY c.year_level, c.course_code";
+
+    $params = [$current_semester, $student_id];
+    if (!empty($temp_course_ids)) $params = array_merge($params, $temp_course_ids);
+
+    $stmt = $conn->prepare($sql);
+    $stmt->execute($params);
+    $courses = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Check prerequisites
+    $passed_stmt = $conn->prepare("SELECT course_id FROM student_subjects WHERE student_id = ? AND status = 'passed'");
+    $passed_stmt->execute([$student_id]);
+    $passed_courses = $passed_stmt->fetchAll(PDO::FETCH_COLUMN);
+
+    // Track which schedule slots are taken (day+time combos)
+    $booked_slots = []; // array of [day, start_time, end_time]
+
+    // Load already-enrolled slots from DB
+    $enrolled_slots = $conn->prepare("
+        SELECT scs.day_of_week, scs.start_time, scs.end_time
+        FROM student_enrollments se
+        JOIN section_courses sc ON se.section_course_id = sc.section_course_id
+        JOIN section_course_schedules scs ON sc.section_course_id = scs.section_course_id
+        WHERE se.student_id = ?
+    ");
+    $enrolled_slots->execute([$student_id]);
+    foreach ($enrolled_slots->fetchAll(PDO::FETCH_ASSOC) as $slot) {
+        $booked_slots[] = $slot;
+    }
+
+    // Load temp enrollment slots
+    foreach ($_SESSION['temp_enrollments'] as $te) {
+        $te_slots = $conn->prepare("
+            SELECT day_of_week, start_time, end_time
+            FROM section_course_schedules WHERE section_course_id = ?
+        ");
+        $te_slots->execute([$te['section_course_id']]);
+        foreach ($te_slots->fetchAll(PDO::FETCH_ASSOC) as $slot) {
+            $booked_slots[] = $slot;
+        }
+    }
+
+    function timesOverlap($s1, $e1, $s2, $e2) {
+        return ($s1 < $e2) && ($e1 > $s2);
+    }
+
+    function slotConflicts($newSlots, $bookedSlots) {
+        foreach ($newSlots as $ns) {
+            foreach ($bookedSlots as $bs) {
+                if ($ns['day_of_week'] === $bs['day_of_week']) {
+                    if (timesOverlap($ns['start_time'], $ns['end_time'], $bs['start_time'], $bs['end_time'])) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    $recommendation = [];
+
+    foreach ($courses as $course) {
+        // Check prerequisites
+        $prereq_stmt = $conn->prepare("SELECT prerequisite_course_id FROM course_prerequisites WHERE course_id = ?");
+        $prereq_stmt->execute([$course['course_id']]);
+        $prereqs = $prereq_stmt->fetchAll(PDO::FETCH_COLUMN);
+        $prereqs_met = true;
+        foreach ($prereqs as $pre) {
+            if (!in_array($pre, $passed_courses)) { $prereqs_met = false; break; }
+        }
+        if (!$prereqs_met) continue;
+
+        // Get sections with available slots
+        $sec_stmt = $conn->prepare("
+            SELECT sc.section_course_id, s.section_name, sc.max_capacity, sc.current_enrollment,
+                   (sc.max_capacity - sc.current_enrollment) as available_slots
+            FROM section_courses sc
+            JOIN sections s ON sc.section_id = s.section_id
+            WHERE sc.course_id = ? AND sc.semester = ?
+            HAVING available_slots > 0
+        ");
+        $sec_stmt->execute([$course['course_id'], $current_semester]);
+        $sections = $sec_stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        foreach ($sections as $section) {
+            // Get schedules for this section
+            $sched_stmt = $conn->prepare("
+                SELECT day_of_week, start_time, end_time,
+                       CONCAT(day_of_week, ' ', TIME_FORMAT(start_time,'%h:%i %p'), '-', TIME_FORMAT(end_time,'%h:%i %p')) as label
+                FROM section_course_schedules WHERE section_course_id = ?
+            ");
+            $sched_stmt->execute([$section['section_course_id']]);
+            $section_slots = $sched_stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($section_slots)) continue;
+
+            if (!slotConflicts($section_slots, $booked_slots)) {
+                // This section works — add it to recommendation
+                $schedule_label = implode(', ', array_column($section_slots, 'label'));
+                $recommendation[] = [
+                    'section_course_id' => $section['section_course_id'],
+                    'course_code'       => $course['course_code'],
+                    'course_title'      => $course['course_title'],
+                    'section_name'      => $section['section_name'],
+                    'units'             => $course['units'],
+                    'schedule'          => $schedule_label,
+                    'available_slots'   => $section['available_slots'],
+                ];
+                // Mark these slots as booked so next course won't conflict
+                foreach ($section_slots as $slot) $booked_slots[] = $slot;
+                break; // move to next course
+            }
+        }
+    }
+
+    echo json_encode(['success' => true, 'recommendation' => $recommendation]);
+    exit();
+}
+// ====================================================
 // 🔹 AJAX: Get current semester only
 // ====================================================
 if (isset($_GET['action']) && $_GET['action'] === 'get_current_semester') {
@@ -1288,9 +1434,37 @@ body { background-color: #f8f9fa; }
         </h5>
 
         <!-- Changed from dropdown to button that opens modal -->
-        <button id="browseSubjectsBtn" class="btn btn-primary w-100 mb-3">
-          <i class="bi bi-search me-2"></i> Browse Available Subjects
-        </button>
+        <!-- Smart Recommendation Button -->
+<button id="getRecommendationBtn" class="btn btn-outline-maroon w-100 mb-2">
+  <i class="bi bi-stars me-2"></i> Smart Schedule Recommendation
+</button>
+
+<!-- Original browse button -->
+<button id="browseSubjectsBtn" class="btn btn-primary w-100 mb-3">
+  <i class="bi bi-search me-2"></i> Browse Available Subjects Manually
+</button>
+
+<!-- Recommendation Panel (hidden by default) -->
+<div id="recommendationPanel" style="display:none;" class="mb-3">
+  <div class="card border-0 shadow-sm">
+    <div class="card-header d-flex justify-content-between align-items-center" style="background:#fff5f5;border-bottom:1px solid #f0c0c0;">
+      <div>
+        <span class="fw-bold text-maroon" style="font-size:0.95rem;">
+          <i class="bi bi-stars me-1"></i> Recommended Schedule
+        </span>
+        <div id="recSummary" class="small text-muted mt-1"></div>
+      </div>
+      <div class="d-flex gap-2">
+        <button class="btn btn-sm btn-outline-secondary" id="dismissRecBtn">Dismiss</button>
+        <button class="btn btn-sm btn-maroon" id="acceptRecBtn">Use this schedule</button>
+      </div>
+    </div>
+    <div class="card-body p-2" id="recommendationList"></div>
+    <div class="card-footer text-muted" style="font-size:0.75rem;background:transparent;">
+      <i class="bi bi-info-circle me-1"></i>You can still add or remove subjects after accepting.
+    </div>
+  </div>
+</div>
 
         <!-- Selected Subjects Table -->
 <h6 class="text-maroon fw-bold">Selected Subjects</h6>
@@ -1515,6 +1689,95 @@ document.addEventListener('DOMContentLoaded', () => {
   const yearButtons = document.querySelectorAll('.year-btn');
   const currentSemesterBadge = document.getElementById('currentSemesterBadge');
   const currentSemesterBadge2 = document.getElementById('currentSemesterBadge2');
+  // ===== SMART RECOMMENDATION =====
+const getRecommendationBtn = document.getElementById('getRecommendationBtn');
+const recommendationPanel  = document.getElementById('recommendationPanel');
+const recommendationList   = document.getElementById('recommendationList');
+const recSummary           = document.getElementById('recSummary');
+const dismissRecBtn        = document.getElementById('dismissRecBtn');
+const acceptRecBtn         = document.getElementById('acceptRecBtn');
+
+let currentRecommendation = [];
+
+getRecommendationBtn.addEventListener('click', () => {
+    getRecommendationBtn.disabled = true;
+    getRecommendationBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Finding best schedule...';
+    recommendationPanel.style.display = 'none';
+
+    fetch('submit_form.php?action=get_recommendation')
+        .then(r => r.json())
+        .then(data => {
+            getRecommendationBtn.disabled = false;
+            getRecommendationBtn.innerHTML = '<i class="bi bi-stars me-2"></i> Smart Schedule Recommendation';
+
+            if (!data.success || data.recommendation.length === 0) {
+                alert('No conflict-free schedule could be built from the available subjects. Try browsing manually.');
+                return;
+            }
+
+            currentRecommendation = data.recommendation;
+            const totalUnits = data.recommendation.reduce((s, c) => s + parseFloat(c.units), 0);
+            recSummary.textContent = `${data.recommendation.length} subject${data.recommendation.length !== 1 ? 's' : ''} · ${totalUnits} units · No conflicts`;
+
+            recommendationList.innerHTML = data.recommendation.map(c => `
+                <div class="d-flex justify-content-between align-items-start p-2 border-bottom">
+                    <div>
+                        <div class="fw-bold" style="font-size:0.85rem;">${c.course_code} — ${c.course_title}</div>
+                        <div class="text-muted" style="font-size:0.78rem;">
+                            Section ${c.section_name} · ${c.schedule} · ${c.units} units
+                            <span class="badge ms-1" style="background:#eaf3de;color:#3b6d11;font-size:0.7rem;">${c.available_slots} slot${c.available_slots !== 1 ? 's' : ''} left</span>
+                        </div>
+                    </div>
+                    <span class="badge" style="background:#eaf3de;color:#3b6d11;font-size:0.7rem;white-space:nowrap;">No conflict</span>
+                </div>
+            `).join('');
+
+            recommendationPanel.style.display = 'block';
+        })
+        .catch(() => {
+            getRecommendationBtn.disabled = false;
+            getRecommendationBtn.innerHTML = '<i class="bi bi-stars me-2"></i> Smart Schedule Recommendation';
+            alert('Error fetching recommendation. Please try again.');
+        });
+});
+
+dismissRecBtn.addEventListener('click', () => {
+    recommendationPanel.style.display = 'none';
+    currentRecommendation = [];
+});
+
+acceptRecBtn.addEventListener('click', async () => {
+    if (!currentRecommendation.length) return;
+    acceptRecBtn.disabled = true;
+    acceptRecBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Adding...';
+
+    let errors = [];
+    for (const course of currentRecommendation) {
+        const formData = new FormData();
+        formData.append('action',           'add_temp_enrollment');
+        formData.append('section_course_id', course.section_course_id);
+        formData.append('course_code',       course.course_code);
+        formData.append('course_title',      course.course_title);
+        formData.append('section_name',      course.section_name);
+        formData.append('schedule',          course.schedule);
+        formData.append('units',             course.units);
+
+        const res  = await fetch('submit_form.php', { method: 'POST', body: formData });
+        const json = await res.json();
+        if (!json.success) errors.push(`${course.course_code}: ${json.message}`);
+    }
+
+    acceptRecBtn.disabled = false;
+    acceptRecBtn.innerHTML = 'Use this schedule';
+    recommendationPanel.style.display = 'none';
+    currentRecommendation = [];
+
+    loadTempEnrolledSubjects();
+
+    if (errors.length) {
+        alert('Some subjects could not be added:\n' + errors.join('\n'));
+    }
+});
 
   let currentYear = 1;
   let currentGlobalSemester = 1;
