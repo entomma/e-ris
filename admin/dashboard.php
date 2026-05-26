@@ -125,9 +125,9 @@ $current_semester = $stmt->fetch(PDO::FETCH_ASSOC)['setting_value'] ?? '1';
                         </a>
                         <?php endif; ?>
                         
-                        <a href="#" class="list-group-item list-group-item-action">
-                            <i class="bi bi-book me-2"></i>Manage Courses (WIP)
-                        </a>
+                        <a href="import_schedule.php" class="list-group-item list-group-item-action">
+    <i class="bi bi-upload me-2"></i>Import Schedule
+</a>
                         <a href="view_submissions.php" class="list-group-item list-group-item-action">
                             <i class="bi bi-folder me-2"></i>View Submissions
                         </a>
